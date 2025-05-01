@@ -1,9 +1,28 @@
+import os
 import re
+import json
+import logging
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
+from werkzeug.utils import secure_filename
 import docx
+import pandas as pd
 import pdfplumber
 import requests
 from bs4 import BeautifulSoup
-import logging
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+UPLOAD_FOLDER = "uploads"
+RESULT_FOLDER = "results"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(RESULT_FOLDER, exist_ok=True)
+
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload
+ALLOWED_EXTENSIONS = {'docx', 'pdf', 'xlsx', 'html'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.',1)[1].lower() in ALLOWED_EXTENSIONS
 
 def parse_tiet_in_khoan(text_khoan):
     tiet_list = []
@@ -17,7 +36,7 @@ def parse_tiet_in_khoan(text_khoan):
             continue
         if re.match(r'^[-+]\s+', line):
             if current_tiet or current_noidung:
-                tiet_list.append({'tiet': current_tiet if current_tiet else '-',
+                tiet_list.append({'tiet': current_tiet if current_tiet else '-', 
                                   'noidung': '\n'.join(current_noidung).strip()})
             current_tiet = '-'
             current_noidung = [re.sub(r'^[-+]\s+', '', line)]
@@ -25,7 +44,7 @@ def parse_tiet_in_khoan(text_khoan):
         m = re.match(r'^([a-zA-Z])\)\s*(.*)', line)
         if m:
             if current_tiet or current_noidung:
-                tiet_list.append({'tiet': current_tiet if current_tiet else m.group(1),
+                tiet_list.append({'tiet': current_tiet if current_tiet else m.group(1), 
                                   'noidung': '\n'.join(current_noidung).strip()})
             current_tiet = m.group(1)
             current_noidung = [m.group(2).strip()]
@@ -33,15 +52,11 @@ def parse_tiet_in_khoan(text_khoan):
         current_noidung.append(line)
 
     if current_tiet or current_noidung:
-        tiet_list.append({'tiet': current_tiet if current_tiet else '',
-                          'noidung': '\n'.join(current_noidung).strip()})
-    return tiet_list
-
+        tiet_list.append({
+        'tiet': current_tiet if current_tiet else '',
+        'noidung': '\n'.join(current_noidung).strip()
+        })
 def parse_docx_file(filepath, use_ai=False):
-    """
-    Đọc file DOCX và tách văn bản pháp luật theo cấu trúc: Chương, Điều, Khoản, Tiết
-    Dùng quy tắc regex đơn giản. use_ai hiện là placeholder có thể mở rộng.
-    """
     doc = docx.Document(filepath)
     records = []
 
@@ -103,7 +118,6 @@ def parse_docx_file(filepath, use_ai=False):
     return records
 
 def parse_docx_text(text):
-    """Tách text thô thành các đoạn nhỏ."""
     chunks = text.split('\n\n')
     records = []
     for c in chunks:
@@ -112,7 +126,6 @@ def parse_docx_text(text):
     return records
 
 def extract_text_pdf(filepath):
-    """Trích xuất văn bản thô từ file PDF."""
     texts = []
     try:
         with pdfplumber.open(filepath) as pdf:
@@ -120,18 +133,17 @@ def extract_text_pdf(filepath):
                 texts.append(page.extract_text() or "")
         return "\n".join(texts)
     except Exception as e:
-        logging.error(f"Lỗi đọc PDF: {e}")
+        logging.error(f"Đọc PDF lỗi: {e}")
         return ""
 
 def extract_text_html(url_or_content):
-    """Lấy văn bản từ URL hoặc HTML thô."""
     if url_or_content.lower().startswith("http"):
         try:
             r = requests.get(url_or_content)
             r.raise_for_status()
             content = r.text
         except Exception as e:
-            logging.error(f"Lỗi lấy HTML: {e}")
+            logging.error(f"Lấy HTML lỗi: {e}")
             return ""
     else:
         content = url_or_content
@@ -147,7 +159,6 @@ def extract_text_html(url_or_content):
         if t:
             texts.append(t)
     return "\n".join(texts)
-    from flask import send_from_directory
 
 @app.route('/', methods=['GET'])
 def index():
@@ -168,42 +179,19 @@ def index():
             }}
             h2 {{ text-align: center; margin-bottom: 20px;}}
             input[type="file"] {{
-                width: 100%;
-                padding: 10px;
-                border: 1px solid #ccc;
-                border-radius: 5px;
+                width: 100%; padding: 10px;
+                border: 1px solid #ccc; border-radius: 5px;
                 background: #f9f9f9;
             }}
-            label {{
-                font-weight: bold;
-                display: block;
-                margin-top: 15px;
-            }}
+            label {{font-weight: bold; display: block; margin-top:15px;}}
             button {{
-                margin-top: 20px;
-                padding: 10px 20px;
-                font-size: 16px;
-                background: #0078D4;
-                color: white;
-                border: none;
-                border-radius: 5px;
+                margin-top: 20px; padding: 10px 20px; font-size: 16px;
+                background: #0078D4; color: white; border:none; border-radius: 5px;
                 cursor: pointer;
             }}
-            button:hover {{
-                background:#005a9e;
-            }}
-            .result-links {{
-                margin-top: 20px;
-            }}
-            .result-links a {{
-                display: block;
-                margin-bottom: 10px;
-                color: #0078D4;
-                text-decoration: none;
-            }}
-            .result-links a:hover {{
-                text-decoration: underline;
-            }}
+            button:hover {{background:#005a9e;}}
+            .result-links {{ margin-top: 20px;}}
+            .result-links a {{ display: block; margin-bottom: 10px; }}
         </style>
     </head>
     <body>
@@ -228,78 +216,11 @@ def index():
     for f in files:
         links += f'<a href="/download/{f}" target="_blank">{f}</a><br>'
     return html.format(links=links)
-
-@app.route('/upload_files', methods=['POST'])
-def upload_files():
-    if 'files' not in request.files:
-        return "Không có file được gửi.", 400
-    files = request.files.getlist('files')
-    use_ai = 'use_ai_support' in request.form
-
-    result_links = []
-    for file in files:
-        if file.filename == '':
-            continue
-        if not allowed_file(file.filename):
-            return f"File không được hỗ trợ: {file.filename}", 400
-        filename = secure_filename(file.filename)
-        save_path = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(save_path)
-
-        extension = filename.rsplit('.', 1)[1].lower()
-
-        records = []
-        if extension == 'docx':
-            records = parse_docx_file(save_path, use_ai=use_ai)
-        elif extension == 'pdf':
-            text = extract_text_pdf(save_path)
-            records = parse_docx_text(text)
-        elif extension == 'xlsx':
-            df = pd.read_excel(save_path)
-            expected_cols = {'Chương', 'Điều', 'Khoản', 'Tiết', 'Nội dung'}
-            if expected_cols.issubset(set(df.columns)):
-                records = df.to_dict(orient='records')
-            else:
-                return f"File {filename} thiếu cột bắt buộc.", 400
-        elif extension == 'html':
-            url = filename  # Bạn có thể thay đổi lấy URL khác tùy thực tế
-            html_text = extract_text_html(url)
-            records = parse_docx_text(html_text)
-        else:
-            return f"Không hỗ trợ định dạng file {filename}", 400
-
-        base_name = os.path.splitext(filename)[0]
-        out_xlsx = os.path.join(RESULT_FOLDER, f"{base_name}_processed.xlsx")
-        out_json = os.path.join(RESULT_FOLDER, f"{base_name}_processed.json")
-
-        df_out = pd.DataFrame(records)
-        df_out.to_excel(out_xlsx, index=False, encoding='utf-8')
-
-        with open(out_json, 'w', encoding='utf-8') as fjson:
-            json.dump(records, fjson, ensure_ascii=False, indent=4)
-
-        result_links.append(out_xlsx)
-        result_links.append(out_json)
-
-    links_html = "<h3>File kết quả:</h3>"
-    for f in result_links:
-        fname = os.path.basename(f)
-        links_html += f'<a href="/download/{fname}" target="_blank">{fname}</a><br>'
-
-    return """
-    <html><body>
-    {0}
-    <br><a href="/">Quay lại trang chính</a>
-    </body></html>
-    """.format(links_html)
-    @app.route('/download/<filename>')
+@app.route('/download/<filename>')
 def download_file(filename):
     return send_from_directory(RESULT_FOLDER, filename, as_attachment=True)
 
-
 if __name__ == "__main__":
-    import sys
-
     # Tạo thư mục nếu chưa tồn tại
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(RESULT_FOLDER, exist_ok=True)

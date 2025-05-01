@@ -228,3 +228,64 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8001))
     logging.info(f"Starting appsplit on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=True)
+@app.route('/upload_files', methods=['POST'])
+def upload_files():
+    if 'files' not in request.files:
+        return "Không có file được gửi.", 400
+    files = request.files.getlist('files')
+    use_ai = 'use_ai_support' in request.form
+
+    result_links = []
+    for file in files:
+        if file.filename == '':
+            continue
+        if not allowed_file(file.filename):
+            return f"File không được hỗ trợ: {file.filename}", 400
+        filename = secure_filename(file.filename)
+        save_path = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(save_path)
+
+        # Đây ví dụ gọi hàm xử lý file.docx , bạn mở rộng cho pdf, xlsx, html
+        if filename.lower().endswith('.docx'):
+            records = parse_docx_file(save_path, use_ai=use_ai)
+        elif filename.lower().endswith('.pdf'):
+            text = extract_text_pdf(save_path)
+            records = parse_docx_text(text)
+        elif filename.lower().endswith('.xlsx'):
+            df = pd.read_excel(save_path)
+            expected_cols = {'Chương','Điều','Khoản','Tiết','Nội dung'}
+            if expected_cols.issubset(set(df.columns)):
+                records = df.to_dict(orient='records')
+            else:
+                return f"File {filename} thiếu cột bắt buộc.", 400
+        elif filename.lower().endswith('.html'):
+            url = filename  # Bạn có thể xử lý url hoặc nội dung html ở đây
+            html_text = extract_text_html(url)
+            records = parse_docx_text(html_text)
+        else:
+            return f"Không hỗ trợ định dạng file {filename}", 400
+
+        base_name = os.path.splitext(filename)[0]
+        out_xlsx = os.path.join(RESULT_FOLDER, f"{base_name}_processed.xlsx")
+        out_json = os.path.join(RESULT_FOLDER, f"{base_name}_processed.json")
+
+        df_out = pd.DataFrame(records)
+        df_out.to_excel(out_xlsx, index=False, encoding='utf-8')
+
+        with open(out_json, 'w', encoding='utf-8') as fjson:
+            json.dump(records, fjson, ensure_ascii=False, indent=4)
+
+        result_links.append(out_xlsx)
+        result_links.append(out_json)
+
+    links_html = "<h3>File kết quả:</h3>"
+    for f in result_links:
+        fname = os.path.basename(f)
+        links_html += f'<a href="/download/{fname}" target="_blank">{fname}</a><br>'
+
+    return """
+    <html><body>
+    {0}
+    <br><a href="/">Quay lại trang chính</a>
+    </body></html>
+    """.format(links_html)

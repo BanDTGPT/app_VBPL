@@ -11,6 +11,7 @@ from cryptography.fernet import Fernet
 
 app = Flask(__name__)
 
+# --- Mã hóa config ---
 FERNET_KEY_FILE = 'fernet.key'
 CONFIG_FILE = 'config.enc'
 
@@ -42,24 +43,25 @@ def load_config():
 
 config = load_config()
 
-def update_config_from_env():
-    changed = False
-    if os.environ.get("OPENAI_API_KEY"):
-        config['openai_api_key'] = os.environ.get("OPENAI_API_KEY")
-        changed = True
-    if os.environ.get("TELEGRAM_BOT_TOKEN"):
-        config['telegram_bot_token'] = os.environ.get("TELEGRAM_BOT_TOKEN")
-        changed = True
-    if changed:
-        save_config(config)
+# Load API keys từ biến môi trường nếu có (ưu tiên env vars)
+updated = False
+if os.environ.get("OPENAI_API_KEY"):
+    config['openai_api_key'] = os.environ["OPENAI_API_KEY"]
+    updated = True
+if os.environ.get("TELEGRAM_BOT_TOKEN"):
+    config['telegram_bot_token'] = os.environ["TELEGRAM_BOT_TOKEN"]
+    updated = True
+if updated:
+    save_config(config)
 
-update_config_from_env()
-
+# Token rate limit quản lý
 token_usage = {'count': 0, 'timestamp': time.time()}
 token_lock = threading.Lock()
 
+# Cache câu hỏi trả lời
 cache = {}
 
+# Queue lưu request chat
 api_queue = queue.Queue()
 
 def wait_token_available(estimated_tokens):
@@ -84,11 +86,24 @@ def call_openai_api(question, model):
             model=model,
             messages=[{"role": "user", "content": question}],
             temperature=0.2,
-            max_tokens=2000
+            max_tokens=2000,
         )
         return rsp['choices'][0]['message']['content']
     except Exception as e:
         return f"Lỗi API OpenAI: {e}"
+
+def get_default_source_data():
+    src_cfg = config.get("tg_default_data_source", {})
+    src_type = src_cfg.get("type", "")
+    path = src_cfg.get("path", "")
+    if src_type == "gdrive":
+        # TODO: tích hợp thực lấy dữ liệu Google Drive
+        return f"[Dữ liệu giả định từ Google Drive folder ID: {path}]"
+    elif src_type == "web":
+        # TODO: lấy dữ liệu web thật
+        return f"[Dữ liệu giả định từ web url: {path}]"
+    else:
+        return "[Chưa cấu hình nguồn dữ liệu mặc định cho bot]"
 
 def api_worker():
     while True:
@@ -96,8 +111,9 @@ def api_worker():
         if item is None:
             break
         question, model, use_default_source, result = item
-        key_string = f"{question}{model}" + ("default" if use_default_source else "")
-        key = hashlib.sha256(key_string.encode()).hexdigest()
+        key = hashlib.sha256(
+            (question + model + ("default" if use_default_source else "")).encode()
+        ).hexdigest()
         if key in cache:
             result["answer"] = cache[key]
         else:
@@ -110,23 +126,14 @@ def api_worker():
             result["answer"] = answer
         api_queue.task_done()
 
-def get_default_source_data():
-    default_cfg = config.get("tg_default_data_source", {})
-    src_type = default_cfg.get("type", "")
-    path = default_cfg.get("path", "")
-    if src_type == "gdrive":
-        return f"[Dữ liệu giả định từ Google Drive folder ID: {path}]"
-    elif src_type == "web":
-        return f"[Dữ liệu giả định từ web URL: {path}]"
-    else:
-        return "[Chưa cấu hình nguồn dữ liệu mặc định cho bot]"
-
 worker_thread = threading.Thread(target=api_worker, daemon=True)
 worker_thread.start()
 
 INDEX_HTML = """
 <!DOCTYPE html>
-<html><head><title>AI Pháp luật</title></head><body style="font-family: Arial">
+<html>
+<head><title>AI Pháp luật</title></head>
+<body style="font-family: Arial">
 <h1>Ứng dụng Pháp luật AI</h1>
 <h3>Cấu hình API & Model</h3>
 <form id="configForm">
@@ -154,30 +161,25 @@ INDEX_HTML = """
     <input type="text" id="tgSourcePath" style="width:400px"><br><br>
     <button type="submit">Lưu cấu hình</button>
 </form>
-
 <hr>
-
 <h3>Đặt câu hỏi (Web)</h3>
 <textarea id="question" rows="4" cols="80" placeholder="Nhập câu hỏi ở đây"></textarea><br>
 <button onclick="sendQuestion(false)">Gửi câu hỏi (Chọn nguồn dữ liệu)</button>
 <button onclick="sendQuestion(true)">Gửi câu hỏi (Mặc định Telegram Bot)</button>
-
 <h3>Trả lời:</h3>
 <pre id="answer" style="white-space: pre-wrap; border:1px solid #ccc; width:90%; height:200px;"></pre>
 
 <script>
-document.getElementById('configForm').onsubmit = async function(e) {
+document.getElementById('configForm').onsubmit = async function(e){
     e.preventDefault();
     let apiKey = document.getElementById('apiKey').value.trim();
+    if (!apiKey) { alert("Vui lòng nhập OpenAI API Key!"); return; }
     let tgToken = document.getElementById('telegramToken').value.trim();
     let model = document.getElementById('model').value;
     let tokenLimit = parseInt(document.getElementById('tokenLimit').value);
     let tgSourceType = document.getElementById('tgSourceType').value;
     let tgSourcePath = document.getElementById('tgSourcePath').value.trim();
-    if(!apiKey) {
-        alert("Vui lòng nhập OpenAI API Key!");
-        return;
-    }
+
     let resp = await fetch('/config', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
@@ -190,12 +192,12 @@ document.getElementById('configForm').onsubmit = async function(e) {
         })
     });
     let data = await resp.json();
-    alert(data.status);
+    alert(data.status || "Đã lưu cấu hình!");
 }
 
 async function sendQuestion(useDefaultSource){
     let q = document.getElementById('question').value.trim();
-    if(!q) {
+    if(!q){
         alert("Nhập câu hỏi!");
         return;
     }
@@ -203,13 +205,13 @@ async function sendQuestion(useDefaultSource){
     let resp = await fetch('/ask', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ question: q, use_default_source: useDefaultSource })
+        body: JSON.stringify({question: q, use_default_source: useDefaultSource})
     });
     let data = await resp.json();
     if(data.answer){
         document.getElementById('answer').textContent = data.answer;
-    } else {
-        document.getElementById('answer').textContent = "Lỗi: không nhận được câu trả lời";
+    }else{
+        document.getElementById('answer').textContent = "Lỗi: không nhận được câu trả lời.";
     }
 }
 </script>
@@ -221,9 +223,6 @@ def index():
     return render_template_string(INDEX_HTML)
 
 @app.route('/config', methods=['POST'])
-def save_config_route():
+def config_route():
     data = request.get_json()
-    if not data or 'openai_api_key' not in data or not data['openai_api_key']:
-        return jsonify({'status': 'Thiếu OpenAI API Key!'}), 400
-    global config
-    config
+    if not data or 'openai_api_key' not in data or not data

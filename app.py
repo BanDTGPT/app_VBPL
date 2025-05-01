@@ -4,12 +4,16 @@ import time
 import queue
 import hashlib
 import json
+import logging
 
 from flask import Flask, request, jsonify, render_template_string
 import openai
 from cryptography.fernet import Fernet
 
 app = Flask(__name__)
+
+# --- Thiết lập logger đơn giản ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # --- Mã hóa config ---
 FERNET_KEY_FILE = 'fernet.key'
@@ -22,6 +26,7 @@ def load_or_create_fernet_key():
     key = Fernet.generate_key()
     with open(FERNET_KEY_FILE, 'wb') as f:
         f.write(key)
+    logging.info("Tạo mới fernet key")
     return key
 
 fernet_key = load_or_create_fernet_key()
@@ -32,6 +37,7 @@ def save_config(data):
     enc = fernet.encrypt(raw)
     with open(CONFIG_FILE, 'wb') as f:
         f.write(enc)
+    logging.info("Đã lưu config mã hóa")
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -90,6 +96,7 @@ def call_openai_api(question, model):
         )
         return rsp['choices'][0]['message']['content']
     except Exception as e:
+        logging.error(f"Lỗi gọi OpenAI API: {e}")
         return f"Lỗi API OpenAI: {e}"
 
 def get_default_source_data():
@@ -109,12 +116,14 @@ def api_worker():
     while True:
         item = api_queue.get()
         if item is None:
+            logging.info("Worker thread dừng")
             break
         question, model, use_default_source, result = item
         key = hashlib.sha256(
             (question + model + ("default" if use_default_source else "")).encode()
         ).hexdigest()
         if key in cache:
+            logging.info("Trả lời từ cache")
             result["answer"] = cache[key]
         else:
             context = ""
@@ -222,7 +231,4 @@ async function sendQuestion(useDefaultSource){
 def index():
     return render_template_string(INDEX_HTML)
 
-@app.route('/config', methods=['POST'])
-def config_route():
-    data = request.get_json()
-    if not data or 'openai_api_key' not in data or not data
+@app.route

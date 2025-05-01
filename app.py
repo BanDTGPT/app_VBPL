@@ -5,6 +5,8 @@ import queue
 import hashlib
 import json
 import logging
+import signal
+import sys
 
 from flask import Flask, request, jsonify, render_template_string
 import openai
@@ -12,7 +14,7 @@ from cryptography.fernet import Fernet
 
 app = Flask(__name__)
 
-# --- Thiết lập logger đơn giản ---
+# --- Logger ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # --- Mã hóa config ---
@@ -60,14 +62,11 @@ if os.environ.get("TELEGRAM_BOT_TOKEN"):
 if updated:
     save_config(config)
 
-# Token rate limit quản lý
+# Token quản lý rate limit
 token_usage = {'count': 0, 'timestamp': time.time()}
 token_lock = threading.Lock()
 
-# Cache câu hỏi trả lời
 cache = {}
-
-# Queue lưu request chat
 api_queue = queue.Queue()
 
 def wait_token_available(estimated_tokens):
@@ -104,10 +103,8 @@ def get_default_source_data():
     src_type = src_cfg.get("type", "")
     path = src_cfg.get("path", "")
     if src_type == "gdrive":
-        # TODO: tích hợp thực lấy dữ liệu Google Drive
         return f"[Dữ liệu giả định từ Google Drive folder ID: {path}]"
     elif src_type == "web":
-        # TODO: lấy dữ liệu web thật
         return f"[Dữ liệu giả định từ web url: {path}]"
     else:
         return "[Chưa cấu hình nguồn dữ liệu mặc định cho bot]"
@@ -137,7 +134,6 @@ def api_worker():
 
 worker_thread = threading.Thread(target=api_worker, daemon=True)
 worker_thread.start()
-
 INDEX_HTML = """
 <!DOCTYPE html>
 <html>
@@ -229,6 +225,50 @@ async function sendQuestion(useDefaultSource){
 
 @app.route('/')
 def index():
+    # Cung cấp cấu hình hiện hành để hiển thị mặc định form cấu hình
+    # Cách đơn giản là embed cấu hình vào javascript hoặc load khi load trang (ở đây để đơn giản không đổ hiện config sẵn)
     return render_template_string(INDEX_HTML)
 
-@app.route
+@app.route('/config', methods=['POST'])
+def config_route():
+    data = request.get_json()
+    if not data or 'openai_api_key' not in data or not data['openai_api_key']:
+        return jsonify({'status': 'Bạn phải nhập OpenAI API Key!'}), 400
+    # Cập nhật config và lưu
+    config.update(data)
+    save_config(config)
+    logging.info("Cấu hình mới đã được lưu")
+    return jsonify({'status': 'Lưu cấu hình thành công!'})
+
+@app.route('/ask', methods=['POST'])
+def ask_route():
+    data = request.get_json()
+    question = data.get('question', '').strip()
+    use_default_source = data.get('use_default_source', False)
+    if not question:
+        return jsonify({'answer': 'Vui lòng nhập câu hỏi!'}), 400
+    model = config.get('model', 'gpt-3.5-turbo')
+    result = {}
+    api_queue.put((question, model, use_default_source, result))
+    timeout = 20
+    poll_interval = 0.5
+    waited = 0
+    while waited < timeout:
+        if 'answer' in result:
+            return jsonify({'answer': result['answer']})
+        time.sleep(poll_interval)
+        waited += poll_interval
+    return jsonify({'answer': 'Hết thời gian chờ xử lý, vui lòng thử lại sau.'}), 504
+    
+def signal_handler(sig, frame):
+    logging.info('Nhận tín hiệu dừng, kết thúc worker thread...')
+    api_queue.put(None)  # Đưa None để worker thread nhận và thoát
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    logging.info(f"Khởi chạy app trên cổng {port}")
+    app.run(host="0.0.0.0", port=port)

@@ -67,16 +67,134 @@ def save_memory(session_id, memory_data):
 
 # --- Module chuẩn hóa và tách văn bản ---
 def parse_tiet_in_khoan(text_khoan):
-    # ... (code như mẫu parse_tiet_in_khoan trước đó)...
+    tiet_list = []
+    lines = text_khoan.strip().split('\n')
+    current_tiet = None
+    current_noidung = []
 
-def parse_docx_file(filepath):
-    # ... (code đọc docx và tách Chương, Điều, Khoản, Tiết theo mẫu)...
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r'^[-+]\s+', line):
+            if current_tiet or current_noidung:
+                tiet_list.append({'tiet': current_tiet if current_tiet else '-', 
+                                  'noidung': '\n'.join(current_noidung).strip()})
+            current_tiet = '-'
+            current_noidung = [re.sub(r'^[-+]\s+', '', line)]
+            continue
+        m = re.match(r'^([a-zA-Z])\)\s*(.*)', line)
+        if m:
+            if current_tiet or current_noidung:
+                tiet_list.append({'tiet': current_tiet if current_tiet else m.group(1), 
+                                  'noidung': '\n'.join(current_noidung).strip()})
+            current_tiet = m.group(1)
+            current_noidung = [m.group(2).strip()]
+            continue
+        current_noidung.append(line)
+
+    if current_tiet or current_noidung:
+        tiet_list.append({'tiet': current_tiet if current_tiet else '', 
+                          'noidung': '\n'.join(current_noidung).strip()})
+    return tiet_list
+
+
+def parse_docx_file(filepath, use_ai=False):
+    import docx
+    doc = docx.Document(filepath)
+    records = []
+
+    chapter_pat = re.compile(r'^CHƯƠNG\s+([IVXLCDM]+)(?:\s*-\s*(.*))?$', re.IGNORECASE)
+    article_pat = re.compile(r'^Điều\s+(\d+)[\.\:]?(.*)$', re.IGNORECASE)
+    clause_pat = re.compile(r'^(Khoản)\s+(\d+)[\.\:]?(.*)$', re.IGNORECASE)
+
+    current_chap = ""
+    current_art = ""
+    current_clause = ""
+    buffer_clause = ""
+
+    def flush_clause():
+        nonlocal buffer_clause
+        if buffer_clause.strip():
+            tiet_list = parse_tiet_in_khoan(buffer_clause)
+            for tiet in tiet_list:
+                records.append({
+                    "Chương": current_chap,
+                    "Điều": current_art,
+                    "Khoản": current_clause,
+                    "Tiết": tiet['tiet'],
+                    "Nội dung": tiet['noidung'],
+                })
+            buffer_clause = ""
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+
+        m = chapter_pat.match(text)
+        if m:
+            flush_clause()
+            current_chap = "Chương " + m.group(1)
+            current_art = current_clause = ""
+            continue
+
+        m = article_pat.match(text)
+        if m:
+            flush_clause()
+            current_art = "Điều " + m.group(1)
+            current_clause = ""
+            buffer_clause = m.group(2).strip() if m.group(2) else ""
+            continue
+
+        m = clause_pat.match(text)
+        if m:
+            flush_clause()
+            current_clause = "Khoản " + m.group(2)
+            buffer_clause = m.group(3).strip() if m.group(3) else ""
+            continue
+
+        if buffer_clause:
+            buffer_clause += "\n" + text
+        else:
+            buffer_clause = text
+    flush_clause()
+    return records
+
 
 def extract_text_pdf(filepath):
-    # ... (code đọc pdf sử dụng pdfplumber)...
+    import pdfplumber
+    texts = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            for page in pdf.pages:
+                texts.append(page.extract_text() or "")
+        return "\n".join(texts)
+    except Exception as e:
+        print(f"Lỗi đọc PDF: {e}")
+        return ""
+
 
 def extract_text_html(url_or_content):
-    # ... (code lấy nội dung text từ html) ...
+    import requests
+    from bs4 import BeautifulSoup
+    if url_or_content.lower().startswith("http"):
+        try:
+            r = requests.get(url_or_content)
+            r.raise_for_status()
+            content = r.text
+        except Exception as e:
+            print(f"Lỗi lấy HTML: {e}")
+            return ""
+    else:
+        content = url_or_content
+    soup = BeautifulSoup(content, 'html.parser')
+    content_div = soup.find("div", class_="content") or soup.body
+    if not content_div:
+        return ""
+    paras = content_div.find_all(['p','div'])
+    texts = [p.get_text(separator=' ', strip=True) for p in paras if p.get_text(strip=True)]
+    return "\n".join(texts)
 
 # --- Module Law Retriever tích hợp Embedding và FAISS Index ---
 class LawRetriever:

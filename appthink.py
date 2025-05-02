@@ -1,206 +1,38 @@
 import os
-import re
 import json
 import logging
+import numpy as np
+import faiss
+from flask import Flask, request, jsonify, render_template_string, session
+from openai import OpenAI
+from dotenv import load_dotenv
+import asyncio
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import threading
 import webbrowser
 import time
-import numpy as np
-import faiss
-import requests
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify, render_template_string, send_from_directory
-from werkzeug.utils import secure_filename
-from openai import OpenAI
+import uuid
 
-from dotenv import load_dotenv
-import os
-
-# Load các biến môi trường từ file .env
+logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
-# Ví dụ lấy biến môi trường
-openai_api_key = os.getenv("OPENAI_API_KEY")
-port = int(os.getenv("PORT", 8000))
-telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-
-# Khởi tạo app Flask hoặc OpenAI client với các biến này
-# Ví dụ:
-from flask import Flask
-
-app = Flask(__name__)
-# Khởi tạo OpenAI client với openai_api_key
-
-# Cài đặt logger
-logging.basicConfig(level=logging.INFO)
-
+# --- Flask app ---
 app = Flask(__name__)
 
-UPLOAD_FOLDER = "uploads"
-RESULT_FOLDER = "results"
-MEMORY_FOLDER = "memory"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(RESULT_FOLDER, exist_ok=True)
-os.makedirs(MEMORY_FOLDER, exist_ok=True)
+# Cấu hình từ biến môi trường
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "some-secret")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not OPENAI_API_KEY or not TELEGRAM_BOT_TOKEN:
+    logging.error("Bạn chưa thiết lập OPENAI_API_KEY hoặc TELEGRAM_BOT_TOKEN trong biến môi trường.")
+    exit(1)
 
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB limit
-ALLOWED_EXTENSIONS = {'docx', 'pdf', 'xlsx', 'html'}
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-# --- Module lưu trữ memory local ---
-def get_memory_filepath(session_id):
-    return os.path.join(MEMORY_FOLDER, f"memory_{session_id}.json")
-
-def load_memory(session_id):
-    path = get_memory_filepath(session_id)
-    if not os.path.exists(path):
-        return []
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-def save_memory(session_id, memory_data):
-    path = get_memory_filepath(session_id)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(memory_data, f, ensure_ascii=False, indent=2)
-
-# --- Module chuẩn hóa và tách văn bản ---
-def parse_tiet_in_khoan(text_khoan):
-    tiet_list = []
-    lines = text_khoan.strip().split('\n')
-    current_tiet = None
-    current_noidung = []
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if re.match(r'^[-+]\s+', line):
-            if current_tiet or current_noidung:
-                tiet_list.append({'tiet': current_tiet if current_tiet else '-', 
-                                  'noidung': '\n'.join(current_noidung).strip()})
-            current_tiet = '-'
-            current_noidung = [re.sub(r'^[-+]\s+', '', line)]
-            continue
-        m = re.match(r'^([a-zA-Z])\)\s*(.*)', line)
-        if m:
-            if current_tiet or current_noidung:
-                tiet_list.append({'tiet': current_tiet if current_tiet else m.group(1), 
-                                  'noidung': '\n'.join(current_noidung).strip()})
-            current_tiet = m.group(1)
-            current_noidung = [m.group(2).strip()]
-            continue
-        current_noidung.append(line)
-
-    if current_tiet or current_noidung:
-        tiet_list.append({'tiet': current_tiet if current_tiet else '', 
-                          'noidung': '\n'.join(current_noidung).strip()})
-    return tiet_list
-
-
-def parse_docx_file(filepath, use_ai=False):
-    import docx
-    doc = docx.Document(filepath)
-    records = []
-
-    chapter_pat = re.compile(r'^CHƯƠNG\s+([IVXLCDM]+)(?:\s*-\s*(.*))?$', re.IGNORECASE)
-    article_pat = re.compile(r'^Điều\s+(\d+)[\.\:]?(.*)$', re.IGNORECASE)
-    clause_pat = re.compile(r'^(Khoản)\s+(\d+)[\.\:]?(.*)$', re.IGNORECASE)
-
-    current_chap = ""
-    current_art = ""
-    current_clause = ""
-    buffer_clause = ""
-
-    def flush_clause():
-        nonlocal buffer_clause
-        if buffer_clause.strip():
-            tiet_list = parse_tiet_in_khoan(buffer_clause)
-            for tiet in tiet_list:
-                records.append({
-                    "Chương": current_chap,
-                    "Điều": current_art,
-                    "Khoản": current_clause,
-                    "Tiết": tiet['tiet'],
-                    "Nội dung": tiet['noidung'],
-                })
-            buffer_clause = ""
-
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-
-        m = chapter_pat.match(text)
-        if m:
-            flush_clause()
-            current_chap = "Chương " + m.group(1)
-            current_art = current_clause = ""
-            continue
-
-        m = article_pat.match(text)
-        if m:
-            flush_clause()
-            current_art = "Điều " + m.group(1)
-            current_clause = ""
-            buffer_clause = m.group(2).strip() if m.group(2) else ""
-            continue
-
-        m = clause_pat.match(text)
-        if m:
-            flush_clause()
-            current_clause = "Khoản " + m.group(2)
-            buffer_clause = m.group(3).strip() if m.group(3) else ""
-            continue
-
-        if buffer_clause:
-            buffer_clause += "\n" + text
-        else:
-            buffer_clause = text
-    flush_clause()
-    return records
-
-
-def extract_text_pdf(filepath):
-    import pdfplumber
-    texts = []
-    try:
-        with pdfplumber.open(filepath) as pdf:
-            for page in pdf.pages:
-                texts.append(page.extract_text() or "")
-        return "\n".join(texts)
-    except Exception as e:
-        print(f"Lỗi đọc PDF: {e}")
-        return ""
-
-
-def extract_text_html(url_or_content):
-    import requests
-    from bs4 import BeautifulSoup
-    if url_or_content.lower().startswith("http"):
-        try:
-            r = requests.get(url_or_content)
-            r.raise_for_status()
-            content = r.text
-        except Exception as e:
-            print(f"Lỗi lấy HTML: {e}")
-            return ""
-    else:
-        content = url_or_content
-    soup = BeautifulSoup(content, 'html.parser')
-    content_div = soup.find("div", class_="content") or soup.body
-    if not content_div:
-        return ""
-    paras = content_div.find_all(['p','div'])
-    texts = [p.get_text(separator=' ', strip=True) for p in paras if p.get_text(strip=True)]
-    return "\n".join(texts)
-
-# --- Module Law Retriever tích hợp Embedding và FAISS Index ---
+# --- Module LawRetriever ---
 class LawRetriever:
-    def __init__(self, api_key, embedding_dim=1536):
+    def __init__(self, api_key, embed_dim=1536):
         self.client = OpenAI(api_key=api_key)
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = embed_dim
         self.index = None
         self.records = []
 
@@ -208,180 +40,212 @@ class LawRetriever:
         self.records = records
 
     def create_index(self):
-        # ... (tạo embedding và build index tương tự sample đã gửi)...
+        vectors = []
+        valid_records = []
+        for rec in self.records:
+            try:
+                response = self.client.embeddings.create(
+                    input=rec.get('text', ''),
+                    model="text-embedding-ada-002"
+                )
+                emb = np.array(response.data[0].embedding, dtype=np.float32)
+                vectors.append(emb)
+                valid_records.append(rec)
+            except Exception as e:
+                logging.error(f"Lỗi tạo embedding: {e}")
 
-    def query(self, question, top_k=5):
-        # ... (tra cứu embedded search)...
+        self.records = valid_records
+
+        if not vectors:
+            logging.warning("Không có embedding để tạo chỉ mục.")
+            self.index = None
+            return
+
+        matrix = np.vstack(vectors)
+        self.index = faiss.IndexFlatL2(self.embedding_dim)
+        self.index.add(matrix)
+        logging.info(f"Chỉ mục Faiss tạo thành công với {len(valid_records)} bản ghi.")
+
+    def query(self, text, top_k=5):
+        if not self.index or not self.records:
+            raise RuntimeError("Chưa có chỉ mục hoặc dữ liệu.")
+
+        try:
+            response = self.client.embeddings.create(
+                input=text,
+                model="text-embedding-ada-002"
+            )
+            q_emb = np.array(response.data[0].embedding, dtype=np.float32).reshape(1, -1)
+        except Exception as e:
+            logging.error(f"Lỗi tạo embeddings câu hỏi: {e}")
+            return []
+
+        D, I = self.index.search(q_emb, top_k)
+        results = []
+        for idx in I[0]:
+            if 0 <= idx < len(self.records):
+                results.append(self.records[idx])
+        return results
 
     def format_results(self, results):
-        # ... (format kết quả để tạo prompt)...
+        formatted = []
+        for r in results:
+            ref = f"{r.get('type', '')} {r.get('number', '')} ({r.get('url', '')})"
+            content = r.get('text', '')
+            formatted.append(f"{ref}\n{content}")
+        return "\n\n---\n\n".join(formatted)
 
-# Khởi tạo retriever
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "your_api_key_here"
 law_retriever = LawRetriever(OPENAI_API_KEY)
-INDEX_HTML = """ 
+
+# --- Module Memory quản lý trạng thái chat ---
+MEMORY_DIR = "memory"
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+def get_memory_path(session_id):
+    return os.path.join(MEMORY_DIR, f"memory_{session_id}.json")
+
+def load_memory(session_id):
+    path = get_memory_path(session_id)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    else:
+        return []
+
+def save_memory(session_id, mem_data):
+    path = get_memory_path(session_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(mem_data, f, ensure_ascii=False, indent=2)
+from flask import session
+import uuid
+
+INDEX_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-  <title>App Tra cứu Luật AI</title>
-  <style>
-    /* Giao diện đẹp, responsive, logo, khu vực chat và cấu hình */
-    /* Các style như mình gửi mẫu trước */
-  </style>
+    <title>Tra cứu Pháp luật AI</title>
+    <style>
+        body {
+            font-family: Arial;
+            margin: 40px;
+            background: #f9f9f9;
+        }
+        #container {
+            max-width: 700px;
+            margin: auto;
+            background: white;
+            padding: 20px 30px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,.1);
+        }
+        textarea {
+            width: 100%;
+            height: 80px;
+            font-size: 16px;
+            margin-bottom: 15px;
+            border-radius: 8px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            resize: vertical;
+            font-family: Arial, sans-serif;
+        }
+        button {
+            background: #0078D4;
+            border: none;
+            color: white;
+            padding: 12px 26px;
+            font-size: 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #005ea2;
+        }
+        #answer {
+            white-space: pre-wrap;
+            background: #f0f0f0;
+            border-radius: 8px;
+            padding: 15px;
+            min-height: 150px;
+            font-size: 16px;
+            margin-top: 20px;
+            border: 1px solid #ccc;
+        }
+        h1 {
+            text-align: center;
+            font-weight: 700;
+            margin-bottom: 20px;
+            color: #333;
+        }
+    </style>
 </head>
 <body>
-  <div id="container">
-    <img src="https://cdn-icons-png.flaticon.com/512/2972/2972315.png" alt="Logo" id="logo">
+<div id="container">
     <h1>Tra cứu văn bản pháp luật AI</h1>
-
-    <!-- Khung cấu hình nguồn dữ liệu -->
-    <div>
-      <h2>Cấu hình nguồn dữ liệu</h2>
-      <label>Đường dẫn folder Google Drive hoặc ổ cứng:</label>
-      <input type="text" id="localData" />
-      <br/>
-      <label>Danh sách URL Web tin cậy (mỗi URL một dòng):</label>
-      <textarea id="webUrls" rows="5"></textarea>
-      <br/>
-      <button onclick="saveConfig()">Lưu cấu hình</button>
-    </div>
-
-    <!-- Khung chat -->
-    <div>
-      <h2>Đặt câu hỏi</h2>
-      <textarea id="question" rows="4" placeholder="Nhập câu hỏi tại đây..."></textarea><br/>
-      <button onclick="sendQuestion()">Gửi câu hỏi</button>
-    </div>
-
-    <div id="chatHistory" style="border: 1px solid #ccc; height: 250px; overflow-y: auto; margin-top:15px; padding:8px;"></div>
-
-    <div id="message"></div>
-  </div>
+    <textarea id="question" placeholder="Nhập câu hỏi pháp luật..."></textarea>
+    <button onclick="sendQuestion()">Gửi câu hỏi</button>
+    <div id="answer"></div>
+</div>
 
 <script>
-  async function saveConfig() {
-    const localData = document.getElementById('localData').value.trim();
-    const webUrls = document.getElementById('webUrls').value.trim().split('\\n').map(u => u.trim()).filter(u => u);
-    const resp = await fetch('/config', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({localData, webUrls})
-    });
-    const data = await resp.json();
-    document.getElementById('message').textContent = data.status || data.error;
-  }
-
-  async function sendQuestion() {
+async function sendQuestion() {
     const question = document.getElementById('question').value.trim();
-    if (!question) {
-      alert("Vui lòng nhập câu hỏi!");
-      return;
+    if(!question) {
+        alert("Vui lòng nhập câu hỏi");
+        return;
     }
-    addChat("Bạn", question);
-    document.getElementById('question').value = '';
-    addChat("AI", "Đang xử lý, vui lòng đợi...");
+    const answerDiv = document.getElementById('answer');
+    answerDiv.textContent = "Đang xử lý, vui lòng chờ...";
 
-    const resp = await fetch('/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question})
-    });
-    const data = await resp.json();
-    if(data.answer) {
-      updateLastChat("AI", data.answer);
-    } else {
-      updateLastChat("AI", "Không có phản hồi.");
+    try {
+        const response = await fetch('/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({question: question})
+        });
+        const data = await response.json();
+        if(data.answer) {
+            answerDiv.innerHTML = data.answer.replace(/\\n/g, '<br>');
+        } else if(data.error) {
+            answerDiv.textContent = "Lỗi: " + data.error;
+        }
+    } catch(e) {
+        answerDiv.textContent = "Lỗi kết nối: " + e.message;
     }
-  }
-
-  function addChat(speaker, text) {
-    const div = document.createElement('div');
-    div.innerHTML = `<b>${speaker}:</b> ${text.replace(/\\n/g, '<br/>')}`;
-    document.getElementById('chatHistory').appendChild(div);
-    document.getElementById('chatHistory').scrollTop = document.getElementById('chatHistory').scrollHeight;
-  }
-  function updateLastChat(speaker, text) {
-    const chat = document.getElementById('chatHistory');
-    const last = chat.lastChild;
-    if(last) {
-      last.innerHTML = `<b>${speaker}:</b> ${text.replace(/\\n/g, '<br/>')}`;
-    }
-  }
-
-  // Load cấu hình lúc mở trang
-  window.onload = async () => {
-    const resp = await fetch('/config');
-    if(resp.ok) {
-      const data = await resp.json();
-      document.getElementById('localData').value = data.localData || '';
-      document.getElementById('webUrls').value = (data.webUrls || []).join('\\n');
-    }
-  }
+}
 </script>
 </body>
 </html>
 """
 
-@app.route('/')
+@app.before_request
+def ensure_session():
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+
+@app.route('/', methods=['GET'])
 def index():
     return render_template_string(INDEX_HTML)
 
-@app.route('/config', methods=['GET', 'POST'])
-def config_route():
-    if request.method == 'POST':
-        data = request.get_json()
-        localData = data.get('localData', '').strip()
-        webUrls = data.get('webUrls', [])
-        if not isinstance(webUrls, list):
-            return jsonify({"error": "Danh sách URL không hợp lệ"}), 400
-        config_data = {"localData": localData, "webUrls": webUrls}
-        with open('config.json', 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=2)
-        return jsonify({"status": "Lưu cấu hình thành công"})
-    else:
-        if os.path.exists('config.json'):
-            with open('config.json', 'r', encoding='utf-8') as f:
-                return jsonify(json.load(f))
-        else:
-            return jsonify({"localData": "", "webUrls": []})
-
 @app.route('/chat', methods=['POST'])
 def chat_route():
     data = request.get_json()
-    question = data.get("question", "").strip()
-    if not question:
-        return
-@app.route('/chat', methods=['POST'])
-def chat_route():
-    data = request.get_json()
-    question = data.get("question", "").strip()
+    question = data.get('question','').strip()
     if not question:
         return jsonify({"error": "Vui lòng nhập câu hỏi"}), 400
 
+    session_id = session.get('session_id')
+    memory = load_memory(session_id)
+
     try:
-        # Load cấu hình
-        if os.path.exists('config.json'):
-            with open('config.json', 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
-        else:
-            config_data = {"localData": "", "webUrls": []}
+        results = law_retriever.query(question, top_k=5)
+        context = law_retriever.format_results(results)
 
-        # Chuẩn bị dữ liệu từ config (vd: load từ localData hoặc webUrls)
-        records = law_retriever.prepare_data(question)
-        if records:
-            law_retriever.load_data(records)
-            law_retriever.create_embeddings()
-        else:
-            records = []
+        history_text = "\n".join([f"Bạn: {m['user']}\nAI: {m['ai']}" for m in memory[-10:]])
 
-        # Truy vấn dữ liệu liên quan
-        results = law_retriever.query(question) if records else []
+        prompt = f"{history_text}\n\nDựa trên các đoạn luật sau đây:\n{context}\n\nHỏi: {question}\nTrả lời chi tiết."
 
-        # Tạo prompt để gọi OpenAI
-        context = law_retriever.format_for_prompt(results)
-        prompt = f"Dựa trên các đoạn văn bản luật sau đây:\n{context}\n\nHỏi: {question}\nTrả lời chi tiết và trích dẫn."
-
-        # Gọi OpenAI ChatCompletion
         response = law_retriever.client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -389,24 +253,42 @@ def chat_route():
             max_tokens=2000
         )
         answer = response.choices[0].message.content
+
+        # Lưu ký ức
+        memory.append({"user": question, "ai": answer})
+        save_memory(session_id, memory)
+
         return jsonify({"answer": answer})
-
     except Exception as e:
-        logging.error(f"Lỗi khi xử lý chat: {e}")
-        return jsonify({"error": "Đã xảy ra lỗi khi xử lý câu hỏi. Vui lòng thử lại sau."})
+        logging.error(f"Lỗi trong chat: {e}")
+        return jsonify({"error": "Có lỗi xảy ra, vui lòng thử lại."})
 
+import threading
+import webbrowser
+import time
+import asyncio
 
-if __name__ == '__main__':
-    import threading
-    import webbrowser
-    import time
+async def start_bot():
+    # Khởi tạo và chạy bot Telegram (hàm main async bạn đã định nghĩa)
+    await main()
 
-    port = int(os.environ.get('PORT', 8000))
-    url = f'http://localhost:{port}/'
+def run_bot():
+    # Tạo event loop mới cho thread bot, chạy main async
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(start_bot())
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    url = f"http://localhost:{port}/"
+
+    # Mở trình duyệt sau 1 giây để server sẵn sàng
     def open_browser():
         time.sleep(1)
         webbrowser.open(url)
 
     threading.Thread(target=open_browser).start()
-    app.run(host='0.0.0.0', port=port, debug=True)
+    threading.Thread(target=run_bot, daemon=True).start()  # Chạy bot Telegram song song
+
+    # Chạy Flask app chính trên luồng chính
+    app.run(host="0.0.0.0", port=port, debug=True)

@@ -7,6 +7,23 @@ from flask import Flask, request, jsonify, session
 from openai import OpenAI
 from dotenv import load_dotenv
 
+from flask import render_template_string
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Trang Chủ Tra cứu Pháp luật AI</title></head>
+<body>
+<h1>Chào mừng bạn đến Tra cứu Pháp luật AI</h1>
+<p>Vào <a href="/setting">Cài đặt</a> để bắt đầu.</p>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(INDEX_HTML)
+
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 

@@ -3,11 +3,19 @@ import json
 import logging
 import numpy as np
 import faiss
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, render_template_string
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from flask import render_template_string
+load_dotenv()
+
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "default-secret")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    logging.error("Bạn chưa cấu hình OPENAI_API_KEY trong biến môi trường.")
+    exit(1)
 
 INDEX_HTML = """
 <!DOCTYPE html>
@@ -19,6 +27,7 @@ INDEX_HTML = """
 </body>
 </html>
 """
+
 
 @app.route('/')
 def index():

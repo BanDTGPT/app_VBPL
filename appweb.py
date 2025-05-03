@@ -1,121 +1,107 @@
 import os
 import json
+import uuid
 import logging
+import threading
+import webbrowser
+import time
 import numpy as np
 import faiss
-from flask import Flask, request, jsonify, session, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session
 from openai import OpenAI
 from dotenv import load_dotenv
-
-load_dotenv()
-
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "default-secret")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    logging.error("Bạn chưa cấu hình OPENAI_API_KEY trong biến môi trường.")
-    exit(1)
-
-INDEX_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Trang Chủ Tra cứu Pháp luật AI</title></head>
-<body>
-<h1>Chào mừng bạn đến Tra cứu Pháp luật AI</h1>
-<p>Vào <a href="/setting">Cài đặt</a> để bắt đầu.</p>
-</body>
-</html>
-"""
-
-from flask import redirect
-
-@app.route('/')
-def index():
-    return redirect('/setting')
-
-@app.route('/')
-def index():
-    return render_template_string(INDEX_HTML)
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "your-secret-key")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "your_secret_key")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    logging.error("OPENAI_API_KEY chưa được thiết lập")
+    logging.error("Bạn chưa thiết lập OPENAI_API_KEY trong môi trường.")
     exit(1)
 
-# Lớp LawRetriever - chuyên tra cứu embedded search
+# LawRetriever đơn giản
 class LawRetriever:
-    def __init__(self, api_key, embedding_dim=1536):
+    def __init__(self, api_key, embed_dim=1536):
         self.client = OpenAI(api_key=api_key)
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = embed_dim
         self.index = None
         self.records = []
-        self.config = {
-            "local_path": "",
-            "google_drive_folder_id": "",
-            "web_urls": []
-        }
-
-    def update_config(self, config_data):
-        self.config.update(config_data)
 
     def load_data(self):
-        # Cần mở rộng: đọc file từ local_path, Google Drive, URL, parse chuẩn hóa
-        # Hiện mẫu giả định data sẵn
+        # Demo sample, bạn thay bằng đọc file thực tế hoặc DB
         self.records = [
-            {"text": "Nội dung pháp luật ví dụ 1", "type": "Luật", "number": "31/2024", "url": "local"},
-            {"text": "Nội dung pháp luật ví dụ 2", "type": "Nghị định", "number": "71/2024", "url": "https://hethongphapluat.vn"},
+            {"text":"Đoạn luật mẫu 1", "type":"Luật", "number":"31/2024", "url":"local"},
+            {"text":"Đoạn luật mẫu 2", "type":"Nghị định", "number":"71/2024", "url":"http://hethongphapluat.vn"}
         ]
 
     def create_index(self):
-        if not self.records:
-            logging.warning("Không có dữ liệu để tạo index")
-            self.index = None
-            return
         vectors = []
         valid_records = []
         for rec in self.records:
             try:
                 rsp = self.client.embeddings.create(input=rec["text"], model="text-embedding-ada-002")
-                emb = np.array(rsp.data[0].embedding).astype("float32")
-                vectors.append(emb)
+                vec = np.array(rsp.data[0].embedding, dtype=np.float32)
+                vectors.append(vec)
                 valid_records.append(rec)
             except Exception as e:
-                logging.error(f"Lỗi tạo embedding: {e}")
+                logging.error("Lỗi tạo embedding: %s", e)
+        self.records = valid_records
         if not vectors:
-            logging.warning("Không tạo được vector embedding")
             self.index = None
             return
-        self.records = valid_records
-        matrix = np.stack(vectors)
+        matrix = np.vstack(vectors)
         self.index = faiss.IndexFlatL2(self.embedding_dim)
         self.index.add(matrix)
-        logging.info(f"Tạo index FAISS với {len(valid_records)} bản ghi")
+        logging.info("Tạo index Faiss với %d vectors", len(valid_records))
 
     def query(self, question, top_k=3):
-        if not self.index or not self.records:
-            raise RuntimeError("Chưa tạo index hoặc dữ liệu rỗng")
+        if not self.index:
+            raise RuntimeError("Chưa có index")
         try:
             rsp = self.client.embeddings.create(input=question, model="text-embedding-ada-002")
-            q_emb = np.array(rsp.data[0].embedding).astype("float32").reshape(1, -1)
+            q_vec = np.array(rsp.data[0].embedding, dtype=np.float32).reshape(1, -1)
         except Exception as e:
-            logging.error(f"Lỗi tạo embedding câu hỏi: {e}")
+            logging.error("Embedding lỗi câu hỏi: %s", e)
             return []
-        D, I = self.index.search(q_emb, top_k)
-        return [self.records[i] for i in I[0] if i < len(self.records)]
+        distances, indices = self.index.search(q_vec, top_k)
+        results = [self.records[i] for i in indices[0] if i < len(self.records)]
+        return results
 
     def format_results(self, results):
-        return "\n\n---\n\n".join(
-            [f"{r['type']} {r['number']} ({r['url']})\n{r['text']}" for r in results]
-        )
+        texts = []
+        for r in results:
+            ref = f"{r.get('type','')} {r.get('number','')} ({r.get('url','')})"
+            texts.append(f"{ref}\n{r.get('text','')}")
+        return "\n\n---\n\n".join(texts)
 
 law_retriever = LawRetriever(OPENAI_API_KEY)
+
+# Quản lý lịch sử chat local
+MEMORY_DIR = "history"
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+def get_history_path(session_id):
+    return os.path.join(MEMORY_DIR, f"history_{session_id}.json")
+
+def load_history(session_id):
+    path = get_history_path(session_id)
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return []
+
+def save_history(session_id, history):
+    path = get_history_path(session_id)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+@app.before_request
+def setup_session():
+    if "session_id" not in session:
+        session["session_id"] = str(uuid.uuid4())
 
 from flask import render_template_string
 
@@ -123,7 +109,7 @@ INDEX_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>App Tra cứu Pháp luật AI</title>
+    <title>Tra cứu Pháp luật AI</title>
     <style>
         body {{font-family: Arial; background: #f4f6f8; padding: 20px;}}
         #container {{
@@ -178,58 +164,60 @@ INDEX_HTML = """
 
     <label for="chatInput">Nhập câu hỏi:</label>
     <textarea id="chatInput" rows="4" placeholder="Nhập câu hỏi luật..."></textarea>
-    <button onclick="sendQuestion()">Gửi câu hỏi</button>
+    <button onclick="sendChat()">Gửi câu hỏi</button>
 
     <div id="chatOutput"></div>
 </div>
 
 <script>
 async function saveConfig() {{
-    const ai_version = document.getElementById('aiVersion').value;
+    const ai_model = document.getElementById('aiVersion').value;
     const local_path = document.getElementById('localPath').value.trim();
-    const gdrive_id = document.getElementById('googleDriveId').value.trim();
-    const web_urls_raw = document.getElementById('webUrls').value;
-    const web_urls = web_urls_raw.split(/[\\n,]+/).map(x => x.trim()).filter(x => x.length > 0);
-
+    const google_drive_id = document.getElementById('googleDriveId').value.trim();
+    const web_urls_raw = document.getElementById('webUrls').value.trim();
+    const web_urls = web_urls_raw ? web_urls_raw.split(/[\\n,]+/).map(u => u.trim()).filter(u => u) : [];
     const resp = await fetch('/save_config', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{
-            ai_model: ai_version,
+            ai_model,
             data_sources: {{
-                local_path: local_path,
-                google_drive_id: gdrive_id,
-                web_urls: web_urls
+                local_path,
+                google_drive_id,
+                web_urls
             }}
         }})
     }});
     const data = await resp.json();
-    alert(data.status || data.error || 'Đã lưu cấu hình');
+    alert(data.status || data.error || 'Cấu hình được lưu');
 }}
 
-async function sendQuestion() {{
+async function sendChat() {{
     const question = document.getElementById('chatInput').value.trim();
-    if(!question) {{
-        alert('Vui lòng nhập câu hỏi');
+    if (!question) {{
+        alert('Vui lòng nhập câu hỏi!');
         return;
     }}
-    const output = document.getElementById('chatOutput');
-    output.innerHTML += `<p><strong>Bạn:</strong> ${question}</p><p><em>Đang xử lý...</em></p>`;
+    const chatOutput = document.getElementById('chatOutput');
+    chatOutput.innerHTML += '<div><b>Bạn:</b> ' + question + '</div>';
+    chatOutput.innerHTML += '<div><i>Đang xử lý...</i></div>';
+    chatOutput.scrollTop = chatOutput.scrollHeight;
 
     const resp = await fetch('/chat', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{question}}),
+        body: JSON.stringify({{question}})
     }});
+
     const data = await resp.json();
 
-    output.innerHTML = output.innerHTML.replace('<p><em>Đang xử lý...</em></p>', '');
-    if(data.answer) {{
-        output.innerHTML += `<p><strong>AI:</strong> ${data.answer.replace(/\n/g, '<br>')}</p>`;
-    }} else {{
-        output.innerHTML += `<p><strong>AI:</strong> Có lỗi xảy ra, vui lòng thử lại.</p>`;
+    chatOutput.innerHTML = chatOutput.innerHTML.replace('<div><i>Đang xử lý...</i></div>', '');
+    if (data.answer) {{
+        chatOutput.innerHTML += '<div><b>AI:</b> ' + data.answer.replace(/\\n/g, '<br>') + '</div>';
+    }} else if (data.error) {{
+        chatOutput.innerHTML += '<div><b>Lỗi:</b> ' + data.error + '</div>';
     }}
-    output.scrollTop = output.scrollHeight;
+    chatOutput.scrollTop = chatOutput.scrollHeight;
 }}
 </script>
 </body>
@@ -253,7 +241,7 @@ def chat():
     data = request.get_json()
     question = data.get("question", "").strip()
     if not question:
-        return jsonify({"error": "Nhập câu hỏi"}), 400
+        return jsonify({"error": "Bạn chưa nhập câu hỏi"}), 400
 
     try:
         law_retriever.update_config(config.get("data_sources", {}))
@@ -263,7 +251,7 @@ def chat():
 
         context = law_retriever.format_results(results)
 
-        prompt = f"Dựa trên dữ liệu dưới đây:\n{context}\n\nHỏi: {question}\nTrả lời chi tiết."
+        prompt = f"Dựa trên các đoạn luật dưới đây:\n{context}\n\nHỏi: {question}\nTrả lời chi tiết."
 
         response = law_retriever.client.chat.completions.create(
             model=config.get("ai_model", "gpt-3.5-turbo"),
@@ -276,19 +264,21 @@ def chat():
         return jsonify({"answer": answer})
     except Exception as e:
         logging.error(f"Lỗi chat: {e}")
-        return jsonify({"error": "Lỗi xử lý, vui lòng thử lại."})
-
+        return jsonify({"error": "Lỗi trong quá trình xử lý, thử lại sau."})
 
 import threading
 import webbrowser
 import time
 
 def open_browser(url):
-    time.sleep(1)
+    time.sleep(1)  # đợi server khởi chạy ổn định
     webbrowser.open(url)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     url = f"http://localhost:{port}/"
+    # Tự động mở trình duyệt sau 1 giây
     threading.Thread(target=open_browser, args=(url,), daemon=True).start()
+
+    # Chạy Flask app
     app.run(host="0.0.0.0", port=port, debug=True)

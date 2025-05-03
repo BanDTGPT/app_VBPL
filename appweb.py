@@ -28,6 +28,11 @@ INDEX_HTML = """
 </html>
 """
 
+from flask import redirect
+
+@app.route('/')
+def index():
+    return redirect('/setting')
 
 @app.route('/')
 def index():
